@@ -1,0 +1,301 @@
+1   The Internals of Node
+    00:00:00 - 001   Starting With Node Internals
+    00:03:47 - 002   Module Implementations
+    00:12:11 - 003   Node Backed by C
+    00:18:44 - 004   The Basics of Threads
+    00:25:14 - 005   The Node Event Loop
+    00:31:48 - 006   The Event Loop Implementation
+    00:39:11 - 007   Event Loop Ticks
+    00:45:58 - 008   Is Node Single Threaded
+    00:51:04 - 009   Testing for Single Threads
+    00:57:54 - 010   The Libuv Thread Pool
+    01:01:02 - 011   Threadpools with Multithreading
+    01:07:08 - 012   Changing Threadpool Size
+    01:12:33 - 013   Common Threadpool Questions
+    01:15:50 - 014   Explaining OS Operations
+    01:19:42 - 015   Libuv OS Delegation
+    01:23:02 - 016   OSAsync Common Questions
+    01:25:42 - 017   Review
+    01:28:31 - 018   Crazy Node Behavior
+    01:36:10 - 019   Unexpected Event Loop Events
+2   Enhancing Node Performance
+    01:47:33 - 020   Enhancing Performance
+    01:49:51 - 021   Express Setup
+    01:53:13 - 022   Blocking the Event Loop
+    02:00:20 - 023   Clustering in Theory
+    02:05:31 - 024   Forking Children
+    02:11:09 - 025   Clustering in Action
+    02:16:43 - 026   Benchmarking Server Performance
+    02:22:00 - 027   Benchmark Refactor
+    02:25:55 - 028   Need More Children
+    02:42:38 - 029   PM2 Installation
+    02:45:31 - 030   PM2 Configuration
+    02:52:21 - 031   Webworker Threads
+    02:54:48 - 032   Worker Threads in Action
+    03:06:22 - 033   Benchmarking Workers
+
+### 1. The Event Loop (Modeled via Pseudo-code)
+The video explains that Node.js uses two main dependencies: **V8** (to execute JavaScript) and **libuv** (C++ library for file system, networking, and concurrency). To understand how Node handles asynchronous tasks, the instructor writes "fake" code to simulate the lifecycle of a Node process.
+
+**The Pseudo-Code:**
+```javascript
+// loop.js - Fake code simulating Node's startup
+
+// 1. Node runs the contents of the file
+myFile.runContents(); 
+
+// 2. Node creates arrays to track pending work
+const pendingTimers = [];
+const pendingOSTasks = [];
+const pendingOperations = [];
+
+// 3. New tasks are added to these arrays whenever you call 
+// setTimeout, http.request, or fs.readFile inside myFile.runContents()
+
+// 4. The Event Loop
+// A 'tick' refers to one execution of this loop body
+while(shouldContinue()) {
+    // Step 1: Node checks pendingTimers
+    // Checks: setTimeout, setInterval
+    
+    // Step 2: Node checks pendingOSTasks and pendingOperations
+    // Checks: networking, file system, crypto tasks
+    
+    // Step 3: Pause Execution
+    // Node pauses here and waits for new events to occur.
+    // It continues only when:
+    // - a timer is about to complete
+    // - an OS task is done
+    // - an operation is done
+    
+    // Step 4: Check phase
+    // Checks: setImmediate
+    
+    // Step 5: Handle Close events
+    // Checks: 'close' events (cleanup code)
+}
+
+// 5. Exit back to terminal
+```
+
+**Notes:**
+*   **Start Up:** When you run `node index.js`, Node executes the file contents first. The event loop only starts *after* the file is executed.
+*   **`shouldContinue`:** This internal check looks at the three arrays (`pendingTimers`, `pendingOSTasks`, `pendingOperations`). If any are non-empty, the loop runs again. If all are empty, the process exits.
+*   **The "Pause":** Step 3 is critical. Node does not loop as fast as possible. It waits for tasks to finish before continuing, preventing CPU waste.
+
+---
+
+### 2. Is Node Single-Threaded? (The Libuv Thread Pool)
+While the Node Event Loop is single-threaded, **libuv** provides a thread pool (default 4 threads) that runs computationally expensive tasks outside the event loop.
+
+**The Code (`threads.js`):**
+This code uses `pbkdf2` (a crypto hashing function) to demonstrate multi-threading.
+
+```javascript
+const crypto = require('crypto');
+
+// Determine start time
+const start = Date.now();
+
+// Call pbkdf2 multiple times
+crypto.pbkdf2('a', 'b', 100000, 512, 'sha512', () => {
+    // Log time taken for 1st call
+    console.log('1:', Date.now() - start);
+});
+
+crypto.pbkdf2('a', 'b', 100000, 512, 'sha512', () => {
+    // Log time taken for 2nd call
+    console.log('2:', Date.now() - start);
+});
+```
+
+**Explanation:**
+*   If Node were truly single-threaded, the second call would wait for the first to finish (taking 2 seconds total).
+*   **Actual Result:** Both log statements print roughly the same time (e.g., ~1 second), proving they ran in parallel.
+*   **Thread Pool:** `pbkdf2` delegates work to the C++ side. Libuv uses its thread pool (4 threads by default) to process these hashes simultaneously.
+*   **Limit:** If you run 5 calls, the first 4 will finish together, and the 5th will take longer because it has to wait for a thread to free up.
+
+**Customizing the Thread Pool:**
+You can change the pool size by setting an environment variable before the calls:
+```javascript
+process.env.UV_THREADPOOL_SIZE = 2; // Restricts pool to 2 threads
+```
+
+---
+
+### 3. OS Async Tasks (No Thread Pool)
+Not all asynchronous functions use the thread pool. Network requests leverage the operating system's underlying asynchronous capabilities directly.
+
+**The Code (`async.js`):**
+```javascript
+const https = require('https');
+const start = Date.now();
+
+function doRequest() {
+    https.request('https://www.google.com', res => {
+        res.on('data', () => {});
+        res.on('end', () => {
+            console.log(Date.now() - start);
+        });
+    }).end();
+}
+
+doRequest();
+doRequest();
+doRequest();
+doRequest();
+doRequest();
+doRequest(); // 6 calls total
+```
+
+**Notes:**
+*   **Result:** All 6 requests finish at almost the exact same time.
+*   **Explanation:** `https.request` does not use the 4-thread pool. It delegates to the OS kernel. The OS handles the concurrency, allowing many requests to happen simultaneously without blocking Node threads.
+
+---
+
+### 4. The "Multitask" Interview Question
+This example combines FS, Hash, and HTTP to show how they interact.
+
+**The Code (`multitask.js`):**
+```javascript
+const https = require('https');
+const crypto = require('crypto');
+const fs = require('fs');
+
+const start = Date.now();
+
+function doRequest() {
+    https.request('https://www.google.com', res => {
+        res.on('data', () => {});
+        res.on('end', () => {
+            console.log('HTTP:', Date.now() - start);
+        });
+    }).end();
+}
+
+function doHash() {
+    crypto.pbkdf2('a', 'b', 100000, 512, 'sha512', () => {
+        console.log('Hash:', Date.now() - start);
+    });
+}
+
+doRequest();
+
+fs.readFile('multitask.js', 'utf8', () => {
+    console.log('FS:', Date.now() - start);
+});
+
+doHash();
+doHash();
+doHash();
+doHash();
+```
+
+**The Unexpected Result:**
+The output order is usually:
+1.  **HTTP** (Fastest, handled by OS)
+2.  **Hash**
+3.  **FS** (File System)
+4.  **Hash**
+5.  **Hash**
+
+**Detailed Explanation:**
+*   **HTTP:** Skips the thread pool entirely (OS task), finishes immediately.
+*   **The Thread Pool Jam:** We have 4 threads available. We requested 5 tasks (1 FS read + 4 Hashes).
+*   **FS "Wait":** `fs.readFile` is complex. It requires two trips: one to get file stats, one to read contents.
+    1. Thread 1 picks up FS task (gets stats).
+    2. Threads 2, 3, 4 pick up Hash tasks.
+    3. While Thread 1 waits for the hard drive (stats), it puts the FS task aside and picks up the remaining Hash task (Hash #4).
+    4. Now all 4 threads are busy with Hashes.
+    5. Only when one Hash finishes (freeing a thread) can the thread go back and finish the FS read.
+*   **Conclusion:** This demonstrates that file system operations use the thread pool and can be delayed by CPU-intensive tasks.
+
+---
+
+### 5. Performance: Clustering
+Because the Event Loop is single-threaded, one heavy calculation (like a `while` loop blocking for 5 seconds) blocks *all* incoming requests. Clustering allows you to run multiple instances of Node.
+
+**The Code (`index.js` with Clustering):**
+```javascript
+process.env.UV_THREADPOOL_SIZE = 1; // Example setting
+const cluster = require('cluster');
+
+// Is the file being executed in Master mode?
+if (cluster.isMaster) {
+    // Cause index.js to run again, but in Child mode
+    cluster.fork(); 
+    cluster.fork(); // Create multiple children
+} else {
+    // Child mode: Act like a normal server
+    const express = require('express');
+    const app = express();
+    
+    // Simulate blocking work
+    function doWork(duration) {
+        const start = Date.now();
+        while(Date.now() - start < duration) {}
+    }
+
+    app.get('/', (req, res) => {
+        doWork(5000); // Blocks event loop for 5s
+        res.send('Hi there');
+    });
+
+    app.get('/fast', (req, res) => {
+        res.send('This was fast!');
+    });
+
+    app.listen(3000);
+}
+```
+
+**Notes:**
+*   **Master vs. Child:** `cluster.isMaster` is true for the first instance (Cluster Manager). It calls `fork()` to create workers. The workers run the `else` block (the server).
+*   **Benefit:** If one child is blocked by `doWork`, the other child can still handle the `/fast` request immediately.
+*   **Diminishing Returns:** Creating more children than physical CPU cores can slow performance due to the CPU switching context between threads.
+*   **PM2:** In production, use the **PM2** tool (`pm2 start index.js -i 0`) rather than manual clustering code. It handles restarting crashed instances automatically.
+
+---
+
+### 6. Performance: Worker Threads (Experimental)
+The video briefly covers `web-worker-threads` as an alternative way to run JS in parallel.
+
+**The Code (`index.js` with Workers):**
+```javascript
+const Worker = require('webworker-threads').Worker;
+
+// Create interface
+const worker = new Worker(function() {
+    // This function runs in a separate thread
+    // Context 'this' refers to the thread itself
+    this.onmessage = function() {
+        // Simulate heavy work
+        let counter = 0;
+        while (counter < 1e9) {
+            counter++;
+        }
+        // Send result back to main app
+        postMessage(counter);
+    };
+});
+
+worker.onmessage = function(message) {
+    // Log result received from the thread
+    console.log(message.data);
+};
+
+// Trigger the worker
+worker.postMessage(); 
+```
+
+**Notes:**
+*   **Communication:** You cannot access variables across scopes. You must use `postMessage` (to send data) and `onmessage` (to receive data).
+*   **Use Case:** Only useful for heavy JS logic that you want to move off the main event loop. For built-in tasks like Crypto, Node already uses threads, so this is redundant.
+
+### Summary Analogy
+To solidify understanding, imagine the Node Event Loop as a **Head Waiter** in a restaurant (Single Thread).
+*   **Event Loop:** The waiter takes orders (requests) very fast.
+*   **Thread Pool (Libuv):** If a customer orders a complex meal (Crypto/FS), the waiter doesn't cook it. They give the ticket to the **Kitchen Staff** (Worker Threads).
+*   **OS Async (HTTP):** If a customer asks for a taxi (Network Request), the waiter calls the taxi company. The taxi company (OS) handles it independently; the waiter just waits for the "honk" (callback) to know it's arrived.
+*   **Clustering:** Hiring more Waiters (running multiple Node processes) to serve more tables simultaneously.
